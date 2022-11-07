@@ -12,6 +12,8 @@ struct gatedesc idt[256];
 extern uint vectors[];  // in vectors.S: array of 256 entry pointers
 struct spinlock tickslock;
 uint ticks;
+uint xticks;
+uint lastAge = 0;
 
 void
 tvinit(void)
@@ -99,8 +101,26 @@ trap(struct trapframe *tf)
 
   // Force process to give up CPU on clock tick.
   // If interrupts were on while locks held, would need to check nlock.
-  if(proc && proc->state == RUNNING && tf->trapno == T_IRQ0+IRQ_TIMER)
-    yield();
+  if(proc && proc->state == RUNNING && tf->trapno == T_IRQ0+IRQ_TIMER) {
+    // Process is allowed PRIORITY * QUANT_MULTI ticks to run
+    if (proc->quantum_passover < (proc->priority + 1) * QUANT_MULT) {
+      //cprintf("pid (%d, %d, %d): pass over %d\n", proc->pid, proc->priority, QUANT_MULT, proc->quantum_passover);
+      proc->quantum_passover++;
+      proc->ticks[proc->priority]++;  // Update ticks for priority here?
+    } else {
+      //cprintf("pid %d: ran out of eval time\n", proc->pid);
+      proc->quantum_passover = 0;
+      //proc->ticks[proc->priority]++; // or here?
+      yield();
+    }
+  }
+
+  acquire(&tickslock);
+  if (ticks - lastAge > AGE_PERIOD) {
+    lastAge = ticks;
+    age1();
+  }
+  release(&tickslock);
 
   // Check if the process has been killed since we yielded
   if(proc && proc->killed && (tf->cs&3) == DPL_USER)

@@ -10,7 +10,10 @@ USER_PROGS := \
 	ln\
 	ls\
 	mkdir\
+	mlfqtest\
+	ps\
 	rm\
+	scbf\
 	sh\
 	stressfs\
 	tester\

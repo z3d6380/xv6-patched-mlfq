@@ -3,6 +3,7 @@
 KERNEL_OBJECTS := \
 	bio.o\
 	console.o\
+	cqueue.o\
 	exec.o\
 	file.o\
 	fs.o\

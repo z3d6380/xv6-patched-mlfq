@@ -5,6 +5,8 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "cqueue.h"
+#include "pstat.h"
 
 struct
 {
@@ -13,6 +15,9 @@ struct
 } ptable;
 
 static struct proc *initproc;
+
+// Added for MLFQ
+CQueue cqueues[NPRIO] = {0};
 
 int nextpid = 1;
 extern void forkret(void);
@@ -37,14 +42,25 @@ allocproc(void)
 
   acquire(&ptable.lock);
   for (p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if (p->state == UNUSED)
+    if (p->state == UNUSED) {
+      p->priority = 0;
       goto found;
+    }
   release(&ptable.lock);
   return 0;
 
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  // Added for MLFQ
+  p->priority = 0;
+  p->quantum_passover = 0;
+  for (int i = 0; i < NPRIO; i++)
+  {
+    p->ticks[i] = 0;
+  }
+  cqueue_enqueue(&cqueues[p->priority], p);
+  //
   release(&ptable.lock);
 
   // Allocate kernel stack if possible.
@@ -226,6 +242,12 @@ int wait(void)
       havekids = 1;
       if (p->state == ZOMBIE)
       {
+        for (CQueue *q = cqueues; q <= &cqueues[NPRIO - 1]; q++) {
+          if (cqueue_remove(q, p->pid) != NULL) {
+            p->priority = -1;
+            break;
+          }
+        }
         // Found one.
         pid = p->pid;
         kfree(p->kstack);
@@ -236,6 +258,8 @@ int wait(void)
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
+        p->priority = 0;
+        p->quantum_passover = 0;
         release(&ptable.lock);
         return pid;
       }
@@ -262,34 +286,50 @@ int wait(void)
 //      via swtch back to the scheduler.
 void scheduler(void)
 {
-  struct proc *p;
 
+  // Initialize the cqueues
+  for (CQueue *q = cqueues; q <= &cqueues[NPRIO - 1]; q++) {
+    cqueue_init(q, NPROC);
+  }
+
+  // Start infinite loop for scheduler
   for (;;)
   {
     // Enable interrupts on this processor.
     sti();
 
     // Loop over process table looking for process to run.
-    acquire(&ptable.lock);
-    for (p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    {
-      if (p->state != RUNNABLE)
+    for (int curPrio = 0; curPrio < NPRIO; curPrio++) {
+      CQueue *q = &cqueues[curPrio];
+      if (q->size == 0) {
         continue;
+      }
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-      swtch(&cpu->scheduler, proc->context);
-      switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      proc = 0;
+      acquire(&ptable.lock);
+      struct proc *head = cqueue_dequeue(q);
+      if (head == NULL) {
+        // do nothing
+      } else if (head->state != RUNNABLE) {
+        cqueue_enqueue(q, head);
+      } else {
+        //cqueue_print(q);
+        proc = head;
+        switchuvm(proc);
+        proc->state = RUNNING;
+        swtch(&cpu->scheduler, proc->context);
+        switchkvm();
+        // 'yield()' sets state to RUNNABLE if it has preempted a process
+        if (proc->state == RUNNABLE) {
+          proc->priority = curPrio + 1 < NPRIO ? curPrio + 1 : curPrio;
+          cqueue_enqueue(curPrio + 1 < NPRIO ? &cqueues[curPrio + 1] : q, proc);
+        } else {
+          // Otherwise, 'state' is SLEEPING, add it back to the same queue
+          cqueue_enqueue(q, proc);
+        }
+        proc = 0;
+      }
+      release(&ptable.lock);
     }
-    release(&ptable.lock);
   }
 }
 
@@ -447,4 +487,58 @@ void procdump(void)
     }
     cprintf("\n");
   }
+}
+
+// Added for MLFQ
+int getpinfo(struct pstat *out) {
+  acquire(&ptable.lock);
+  for (struct proc *p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+    if (p->state == UNUSED) {
+      continue;
+    }
+    out->inuse[p->pid] = 1;
+    out->pid[p->pid] = p->pid;
+    out->priority[p->pid] = -1;
+    out->priority[p->pid] = p->priority;
+    strncpy(out->name[p->pid], p->name, sizeof(p->name));
+    out->state[p->pid] = p->state;
+    for (int i = 0; i < NPRIO; i++) {
+      out->ticks[p->pid][i] = p->ticks[i];
+    }
+  }
+  release(&ptable.lock);
+  return 0;
+}
+
+// Added for MLFQ
+void age1(void) {
+  acquire(&ptable.lock);
+  for (CQueue *q = cqueues; q <= &cqueues[NPRIO - 1]; q++) {
+    for (int i = 0; i < q->size; i++) {
+      q->root[i] = NULL;
+    }
+    q->size = 0;
+  }
+  for (struct proc *p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+    if (p->state == RUNNABLE) {
+      p->priority = 0;
+      cqueue_enqueue(&cqueues[p->priority], p);
+    }
+  }
+  release(&ptable.lock);
+}
+
+void age2(int pid) {
+  acquire(&ptable.lock);
+  struct proc* aged;
+  for (CQueue *q = cqueues; q < &cqueues[NPRIO]; q++) {
+    aged = cqueue_remove(q, pid);
+  }
+  for (struct proc *p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+    if (p->state == RUNNABLE && p->pid == aged->pid) {
+      p->priority = 0;
+      cqueue_enqueue(&cqueues[p->priority], p);
+    }
+  }
+  release(&ptable.lock);
 }

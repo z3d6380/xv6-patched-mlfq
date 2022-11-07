@@ -16,4 +16,11 @@
 #define PHYSTOP  0x1000000 // use phys mem up to here as free pool
 #define MAXARG       32  // max exec arguments
 
+// MLFQ parameters
+
+#define NPRIO           8  // number of priority levels
+#define QUANT_MULT      2  // quantum multiplier - how many times larger is each successive priority quantum
+#define AGE_MULT        10  // aging multiplier - how many times larger is each successive priority aging
+#define AGE_PERIOD      100 // how often to age priorities
+
 #endif // _PARAM_H_
